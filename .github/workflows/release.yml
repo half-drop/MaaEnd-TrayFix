@@ -1,0 +1,172 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. v1.0.1'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $version = $env:GITHUB_REF_NAME
+          } elseif ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $version = '${{ inputs.version }}'
+          } else {
+            $version = 'v1.0.0'
+          }
+          if ($version -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid version: $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Release version: $version"
+
+      - name: Setup MSVC developer shell
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Generate full PowrProf proxy surface
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build\generated | Out-Null
+          .\scripts\generate_powrprof_proxy.ps1 -OutputDir build\generated
+
+      - name: Build TrayFix DLL
+        shell: cmd
+        run: |
+          ml64 /nologo /c /Fo build\powrprof_proxy.obj build\generated\powrprof_proxy.asm
+          cl /nologo /std:c++17 /O2 /EHsc /LD /I build\generated src\powrprof_trayfix.cpp build\powrprof_proxy.obj /Fe:build\powrprof.dll /link /DEF:build\generated\powrprof_proxy.def /INCREMENTAL:NO
+
+      - name: Verify complete PowrProf export parity
+        shell: pwsh
+        run: |
+          $system = & dumpbin /nologo /exports C:\Windows\System32\powrprof.dll
+          $proxy = & dumpbin /nologo /exports build\powrprof.dll
+          $pattern = '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)(?:\s*=.*)?$'
+          $systemNames = @($system | ForEach-Object { if ($_ -match $pattern) { $Matches[1] } } | Where-Object { $_ -and $_ -ne '[NONAME]' } | Sort-Object -Unique)
+          $proxyNames = @($proxy | ForEach-Object { if ($_ -match $pattern) { $Matches[1] } } | Where-Object { $_ -and $_ -ne '[NONAME]' -and $_ -ne 'TrayFixMonitor' } | Sort-Object -Unique)
+          $missing = Compare-Object $systemNames $proxyNames | Where-Object SideIndicator -eq '<='
+          if ($missing) {
+            $missing | Format-Table | Out-String | Write-Host
+            throw 'Proxy is missing one or more System32 PowrProf exports'
+          }
+          Write-Host "Verified $($systemNames.Count) System32 PowrProf exports"
+
+      - name: Build compatibility tests
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /O2 /EHsc tests\powrprof_load_test.cpp /Fe:build\powrprof_load_test.exe
+          cl /nologo /std:c++17 /O2 /EHsc tests\powrprof_nvidia_compat_test.cpp /Fe:build\powrprof_nvidia_compat_test.exe
+          cl /nologo /std:c++17 /O2 /EHsc tests\tray_exit_test.cpp /Fe:build\tray_exit_test.exe /link /SUBSYSTEM:WINDOWS
+
+      - name: Verify application-directory loading and PowrProf forwarding
+        shell: pwsh
+        working-directory: build
+        run: |
+          .\powrprof_load_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "powrprof_load_test failed: $LASTEXITCODE" }
+          .\powrprof_nvidia_compat_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "powrprof_nvidia_compat_test failed: $LASTEXITCODE" }
+
+      - name: Verify independent tray cleanup monitor
+        shell: pwsh
+        working-directory: build
+        run: |
+          $marker = Join-Path $PWD 'cleanup-marker.txt'
+          $env:MAAEND_TRAYFIX_TEST_MARKER = $marker
+          .\tray_exit_test.exe
+          $deadline = (Get-Date).AddSeconds(10)
+          $text = ''
+          do {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $marker) { $text = Get-Content $marker -Raw -Encoding Unicode }
+          } while ((Get-Date) -lt $deadline -and $text -notmatch 'monitor-cleanup-called')
+          Write-Host $text
+          foreach ($required in @('hook-installed','hook-seen','monitor-started','monitor-cleanup-called')) {
+            if ($text -notmatch $required) { throw "Missing tray cleanup marker: $required" }
+          }
+
+      - name: Package release assets
+        id: package
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $zipName = "MaaEnd-TrayFix-win-x86_64-$version.zip"
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item build\powrprof.dll package\powrprof.dll
+          @"
+          MaaEnd TrayFix $version (Windows x86_64)
+
+          安装：
+          1. 完全退出 MaaEnd。
+          2. 将 powrprof.dll 放到 MaaEnd.exe 同级目录。
+          3. 正常启动 MaaEnd，无需额外参数。
+
+          卸载：
+          完全退出 MaaEnd 后删除 powrprof.dll。
+          "@ | Set-Content -Encoding UTF8 package\README.txt
+          Compress-Archive -Path package\powrprof.dll,package\README.txt -DestinationPath $zipName -Force
+          $dllHash = (Get-FileHash package\powrprof.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            "$dllHash  powrprof.dll",
+            "$zipHash  $zipName"
+          ) | Set-Content -Encoding ASCII SHA256SUMS.txt
+          "zip=$zipName" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $zipName = '${{ steps.package.outputs.zip }}'
+          if (gh release view $version --repo $env:GITHUB_REPOSITORY 2>$null) {
+            Write-Host "Release $version already exists; skipping publication."
+            exit 0
+          }
+          @"
+          ## MaaEnd TrayFix $version
+
+          修复 MaaEnd 使用“结束自身”等方式退出后，Windows 通知区域残留无效托盘图标、需要鼠标划过才消失的问题。
+
+          ### 安装
+          1. 完全退出 MaaEnd。
+          2. 下载 `powrprof.dll`，放到 `MaaEnd.exe` 同级目录。
+          3. 正常启动 MaaEnd，无需修改配置或启动参数。
+
+          ### 卸载
+          完全退出 MaaEnd，删除同目录的 `powrprof.dll` 即可。
+
+          ### 技术说明
+          - Windows x86_64 `PowrProf.dll` 兼容代理。
+          - 构建时自动镜像 System32 `PowrProf.dll` 的全部命名导出，并转发到真实系统 DLL。
+          - 捕获 MaaEnd 托盘图标注册信息；独立 `rundll32.exe` 监视器在 MaaEnd 进程结束后主动发送 `NIM_DELETE`。
+          - CI 验证完整 PowrProf 导出兼容、NVIDIA 相关接口以及托盘清理链路。
+          "@ | Set-Content -Encoding UTF8 RELEASE_NOTES.md
+
+          gh release create $version `
+            package\powrprof.dll `
+            $zipName `
+            SHA256SUMS.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "MaaEnd TrayFix $version" `
+            --notes-file RELEASE_NOTES.md
