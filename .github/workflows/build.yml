@@ -1,0 +1,91 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup MSVC developer shell
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Generate full PowrProf proxy surface
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build\generated | Out-Null
+          .\scripts\generate_powrprof_proxy.ps1 -OutputDir build\generated
+
+      - name: Build TrayFix DLL
+        shell: cmd
+        run: |
+          ml64 /nologo /c /Fo build\powrprof_proxy.obj build\generated\powrprof_proxy.asm
+          cl /nologo /std:c++17 /O2 /EHsc /LD /I build\generated src\powrprof_trayfix.cpp build\powrprof_proxy.obj /Fe:build\powrprof.dll /link /DEF:build\generated\powrprof_proxy.def /INCREMENTAL:NO
+
+      - name: Verify complete PowrProf export parity
+        shell: pwsh
+        run: |
+          $system = & dumpbin /nologo /exports C:\Windows\System32\powrprof.dll
+          $proxy = & dumpbin /nologo /exports build\powrprof.dll
+          $pattern = '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)(?:\s*=.*)?$'
+          $systemNames = @($system | ForEach-Object { if ($_ -match $pattern) { $Matches[1] } } | Where-Object { $_ -and $_ -ne '[NONAME]' } | Sort-Object -Unique)
+          $proxyNames = @($proxy | ForEach-Object { if ($_ -match $pattern) { $Matches[1] } } | Where-Object { $_ -and $_ -ne '[NONAME]' -and $_ -ne 'TrayFixMonitor' } | Sort-Object -Unique)
+          $missing = Compare-Object $systemNames $proxyNames | Where-Object SideIndicator -eq '<='
+          if ($missing) {
+            $missing | Format-Table | Out-String | Write-Host
+            throw 'Proxy is missing one or more System32 PowrProf exports'
+          }
+          Write-Host "Verified $($systemNames.Count) System32 PowrProf exports"
+
+      - name: Build tests
+        shell: cmd
+        run: |
+          cl /nologo /std:c++17 /O2 /EHsc tests\powrprof_load_test.cpp /Fe:build\powrprof_load_test.exe
+          cl /nologo /std:c++17 /O2 /EHsc tests\powrprof_nvidia_compat_test.cpp /Fe:build\powrprof_nvidia_compat_test.exe
+          cl /nologo /std:c++17 /O2 /EHsc tests\tray_exit_test.cpp /Fe:build\tray_exit_test.exe /link /SUBSYSTEM:WINDOWS
+
+      - name: Verify PowrProf forwarding
+        shell: pwsh
+        working-directory: build
+        run: |
+          .\powrprof_load_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "powrprof_load_test failed: $LASTEXITCODE" }
+          .\powrprof_nvidia_compat_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "powrprof_nvidia_compat_test failed: $LASTEXITCODE" }
+
+      - name: Verify independent tray cleanup monitor
+        shell: pwsh
+        working-directory: build
+        run: |
+          $marker = Join-Path $PWD 'cleanup-marker.txt'
+          $env:MAAEND_TRAYFIX_TEST_MARKER = $marker
+          .\tray_exit_test.exe
+          $deadline = (Get-Date).AddSeconds(10)
+          $text = ''
+          do {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $marker) { $text = Get-Content $marker -Raw -Encoding Unicode }
+          } while ((Get-Date) -lt $deadline -and $text -notmatch 'monitor-cleanup-called')
+          Write-Host $text
+          foreach ($required in @('hook-installed','hook-seen','monitor-started','monitor-cleanup-called')) {
+            if ($text -notmatch $required) { throw "Missing tray cleanup marker: $required" }
+          }
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: MaaEnd-TrayFix-win-x86_64
+          path: build/powrprof.dll
+          retention-days: 14
